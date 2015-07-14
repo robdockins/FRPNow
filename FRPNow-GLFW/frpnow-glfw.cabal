@@ -1,0 +1,29 @@
+Name:                frpnow-glfw
+Version:             0.1
+Synopsis:	     Program GUIs with GLFW and frpnow!
+Description:         Program GUIs with GLFW and frpnow!
+License:             BSD3
+License-file:        LICENSE
+Author:              Rob Dockins
+Homepage:            https://github.com/atzeus/FRPNow
+Build-Type:          Simple
+Cabal-Version:       >=1.6
+Data-files:          ChangeLog
+Category:            Control
+Tested-With:         GHC==7.10.1
+Library
+  Build-Depends:
+    base >= 2 && <= 6,
+    mtl >= 1.0,
+    containers,
+    frpnow,
+    OpenGL,
+    StateVar,
+    GLFW-b
+
+  Exposed-modules: Control.FRPNow.GLFW
+  Extensions:	 RankNTypes, GADTs, CPP, EmptyDataDecls
+
+source-repository head
+    type:     git
+    location: https://github.com/atzeus/FRPNow/FRPNow-GLFW
