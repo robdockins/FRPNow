@@ -12,6 +12,7 @@
 module Control.FRPNow.Lib(
    -- * Behavior construction
    step,
+   cstep,
    -- * Getting events from behaviors 
    when,
    change,
@@ -23,6 +24,7 @@ module Control.FRPNow.Lib(
    cmpTime,
    EvOrd(..),
    -- * Fold and state
+   prev,
    foldB,
    sampleUntil,
    -- * Sample behaviors on events
@@ -45,11 +47,22 @@ import Prelude hiding (until)
 import Debug.Trace
 
 
--- | Shorthand for 
+-- | Start with a constant and then switch 
 -- 
--- > pure a `switch` s
+-- Defined as: 
+--
+-- > step a s = pure a `switch` s
 step :: a -> Event (Behavior a) -> Behavior a
 step a s = pure a `switch` s
+
+
+-- | Start with a constant, and switch to another constant when the event arrives.
+--
+-- Defined as:
+-- 
+-- >  cstep x e y = pure x `switch` (pure y <$ e)
+cstep :: a -> Event x -> a -> Behavior a
+cstep x e y = pure x `switch` (pure y <$ e)
 
 -- | Like 'Control.FRPNow.whenJust' but on behaviors of type @Bool@ instead of @Maybe@. 
 -- 
@@ -59,6 +72,18 @@ when b = whenJust (boolToMaybe <$> b) where
   boolToMaybe True   = Just ()
   boolToMaybe False  = Nothing
 
+
+-- | Gives the previous value of the behavior, starting with given value. 
+-- 
+--  This /cannot/ be used to prevent immediate feedback loop! Use 'Control.FRPNow.EvStream.delay' instead!
+prev :: Eq a => a -> Behavior a -> Behavior (Behavior a)
+prev i b = loop i where
+  loop i = do e <- nxtCur
+              return (i `step` e)
+  nxtCur = futuristic $ 
+             do cur <- b
+                e <- change b
+                planB (loop cur <$ e)
 
 -- | Gives at any point in time the event that the input behavior changes, and the new value of the input behavior.
 change :: Eq a => Behavior a -> Behavior (Event a)
@@ -163,6 +188,8 @@ snapshot b e =  let e' = (Just <$> b) <$ e
 -- value of the given behavior at that time.
 (<@>) :: Behavior (a -> b) -> Event a -> Behavior (Event b)
 b <@> e = plan $ fmap (\x -> b <*> pure x) e
+
+
 
 
 

@@ -1,6 +1,7 @@
-{-# LANGUAGE LambdaCase,RecursiveDo, FlexibleContexts, ExistentialQuantification, Rank2Types,GeneralizedNewtypeDeriving  #-}
+{-# LANGUAGE DeriveDataTypeable, LambdaCase,RecursiveDo, FlexibleContexts, ExistentialQuantification, Rank2Types,GeneralizedNewtypeDeriving  #-}
 -----------------------------------------------------------------------------
 -- |
+
 -- Module      :  Control.FRPNow.Core
 -- Copyright   :  (c) Atze van der Ploeg 2015
 -- License     :  BSD-style
@@ -26,6 +27,8 @@ module Control.FRPNow.Core(
    runNowMaster,
    initNow) where
 import Control.Concurrent.Chan
+import Control.Exception
+import Data.Typeable
 import Control.Applicative hiding (empty,Const)
 import Control.Monad hiding (mapM_)
 import Control.Monad.IO.Class
@@ -92,6 +95,11 @@ data Event a
   | Occ a 
   | E (M (Event a))
 
+newtype EInternal a = EInternal { runEInternal :: M (Either (EInternal a) (Event a)) }
+
+data State = Update
+           | Redirect
+
 runE :: Event a -> M (Event a)
 runE Never   = return Never
 runE (Occ x) = return (Occ x)
@@ -100,7 +108,9 @@ runE (E m)   = m
 
 instance Monad Event where
   return = Occ
-  e  >>= f = memoE (e `bindE` f)
+  Never >>= _ = Never
+  (Occ x) >>= f = f x
+  (E m)   >>= f = memoE $ bindInternal m f
 
 
 -- | A never occuring event
@@ -108,37 +118,64 @@ instance Monad Event where
 never :: Event a
 never = Never
 
-bindE :: Event a -> (a -> Event b) -> Event b
-Never   `bindE` _ = Never
-(Occ x) `bindE` f = f x
-(E m)   `bindE` f = E $ bindEM m f
 
+setE :: a -> Event x -> Event a
+setE _ Never = Never
+setE a (Occ _) = Occ a
+setE a (E m) = E $ setE a <$> m
 
-bindEM :: M (Event a) -> (a -> Event b) -> M (Event b)
-m   `bindEM` f = 
+bindInternal :: M (Event a) -> (a -> Event b) -> EInternal b
+m   `bindInternal` f = EInternal $ 
     m >>= \r -> case r of
-                      Never    -> return Never
-                      Occ x    -> runE (f x)
-                      E m'     -> return (E $ m' `bindEM` f)
--- Section 6.2
+                      Never    -> return (Right Never)
+                      Occ x    -> Right <$> runE (f x)
+                      E m'     -> return (Left $ m' `bindInternal` f)
+
+minTime Never r = setE () r
+minTime l Never = setE () l
+minTime (Occ _) _ = Occ ()
+minTime _ (Occ _) = Occ ()
+minTime (E ml) (E mr) = memoE $ minInternal ml mr
+
+minInternal :: M (Event a) -> M (Event b) -> EInternal ()
+minInternal ml mr = EInternal $ 
+  do er <- mr
+     case er of
+      Occ x -> return (Right (Occ ()))
+      Never -> return (Right (setE () $ E ml))
+      E mr' -> do el <- ml
+                  return $ case el of
+                    Occ x ->  Right (Occ ())
+                    Never -> Right (setE () $ E mr')
+                    E ml' -> Left (minInternal ml' mr')
+                       
 
 
-memoEIO :: Event a -> IO (Event a)
+memoEIO :: EInternal a -> IO (Event a)
 memoEIO einit = 
-  do r <- newIORef einit 
+  do r <- newIORef (Left einit,Nothing )
      return (usePrevE r)
 
-usePrevE :: IORef (Event a) -> Event a
-usePrevE r = E $ 
-  do e <- liftIO (readIORef r)
-     res <- runE e
-     liftIO (writeIORef r res)
-     return res
+usePrevE :: IORef (Either (EInternal a) (Event a), (Maybe (Round, Event a))) -> Event a
+usePrevE r = self where
+ self = E $ 
+  do (s,cached) <- liftIO (readIORef r)
+     round <- getRound
+     case cached of
+        Just (cr,cache) | cr == round -> return cache
+        _ -> case s of
+              Left ei -> do ri <- runEInternal ei
+                            case ri of
+                             Left _  -> do liftIO (writeIORef r (ri,Just (round,self) ) )
+                                           return self 
+                             Right e -> do liftIO (writeIORef r (ri, Just (round,e)) )
+                                           return e
+              Right e -> do e' <- runE e
+                            liftIO (writeIORef r (Right e', Just (round,e')))
+                            return e'
 
-memoE :: Event a -> Event a
+memoE :: EInternal a -> Event a
 --memoE e = e
-memoE Never = Never
-memoE (Occ x) = Occ x
 memoE e = unsafePerformIO $ memoEIO e
   
 -- Section 6.3
@@ -148,70 +185,121 @@ memoE e = unsafePerformIO $ memoEIO e
 data Behavior a = B (M (a, Event (Behavior a)))
                 | Const a 
 
+data BInternal a = BInternal { runBInternal ::  M (Either (BInternal a, a, Event ()) (Behavior a)) }
+
+
+memoBIIO :: BInternal a -> IO (Behavior a)
+memoBIIO einit = 
+  do r <- newIORef (Left einit, Nothing)
+     return (usePrevBI r)
+
+usePrevBI :: IORef (Either (BInternal a) (Behavior a), Maybe (a, Event (Behavior a)) ) -> Behavior a
+usePrevBI r = self where
+ self = B $ 
+  do (s,cached) <- liftIO (readIORef r)
+     case cached of
+      Just (cache@(i,ev)) -> 
+       do ev' <- runE ev
+          case ev' of
+           Occ x -> update s
+           _     -> do liftIO (writeIORef r (s, Just (i,ev')))
+                       return (i,ev')
+      Nothing -> update s
+ update s = case s of
+             Left ei -> do ri <- runBInternal ei
+                           case ri of
+                            Left (bi',i,e) -> 
+                                   do let res = (i, setE self e)
+                                      liftIO (writeIORef r (Left bi',Just res))
+                                      return res
+                            Right b -> do res@(h,t) <- runB b
+                                          liftIO (writeIORef r (Right (rerunBh res), Just res))
+                                          return res
+             Right b -> do res@(h,t) <- runB b
+                           liftIO (writeIORef r (Right (rerunBh res), Just res))
+                           return res
+
+memoBInt :: BInternal a -> Behavior a
+--memoE e = e
+memoBInt e = unsafePerformIO $ memoBIIO e
 
 runB :: Behavior a -> M (a, Event (Behavior a))
 runB (B m) = m
 runB (Const a) = return (a, never)
 
-switch' ::  Behavior a -> Event (Behavior a) -> Behavior a
-switch' b Never = b
-switch' _ (Occ b) = b
-switch' (Const x) (E em) = B $ 
-     em >>= \r -> case r of
-          Never -> return (x,never)
-          Occ b' -> runB b'
-          E em'  -> return (x, E em')
-switch' (B bm) (E em) = B $
-    em >>= \r -> case r of
-        Never      -> bm
-        Occ   b'   -> runB b'
-        E em'      -> 
-            do  (h,t) <- bm
-                return $ case t of
-                  Occ _ -> error "switch already occured!"
-                  Never -> (h, E em')
-                  E tm  -> (h, switchEM tm em')
+rerunBh :: (a,Event(Behavior a)) -> Behavior a
+rerunBh (h,Never) = Const h
+rerunBh (h,t) = B $ runE t >>= \x -> case x of
+        Occ b -> runB b
+        t' -> return (h,t')
 
-switchEM :: M (Event (Behavior a)) -> M (Event (Behavior a)) -> Event (Behavior a)
-switchEM lm rm = E $ 
- rm >>= \case 
-    Never -> lm
-    Occ b -> return (Occ b)
-    E rm'    -> lm >>= return . \case
-         Never -> E rm'
-         Occ b -> Occ (b `switch'` E rm')
-         E lm' -> switchEM lm' rm'
+rerunB :: a -> Event (Behavior a)  -> M (a, Event (Behavior a))
+rerunB h  Never = return (h, Never)
+rerunB h t      = runE t >>= \x -> case x of
+        Occ b -> runB b
+        t' -> return (h,t')
+
+
+switchInternal :: M (a, Event (Behavior a)) -> M (Event (Behavior a)) -> BInternal a
+switchInternal mb me = BInternal $ 
+    do e <- me 
+       case e of
+        Occ x -> return (Right x)
+        Never -> return (Right (B mb))
+        E me' -> do (i,ei) <- mb
+                    return $ Left (switchInternal (rerunB i ei) me', i, minTime ei e)
+
+stepInternal :: a -> M (Event (Behavior a)) -> BInternal a        
+stepInternal i me =BInternal $ 
+    do e <- me 
+       return $ case e of
+        Occ x -> Right x
+        Never -> Right (Const i)
+        E me' -> Left (stepInternal i me', i, setE () e)
+
+bindBInternal :: M (a,Event (Behavior a)) -> (a -> Behavior b) -> BInternal b
+bindBInternal m f = 
+ BInternal $ 
+  do (h,t) <- m
+     case t of
+      Never -> return $ Right (f h)
+      Occ _ -> error "invariant broken"
+      _     -> 
+       case f h of
+        Const x -> return $ Left (bindBInternal (rerunB h t) f, x, setE () t)
+        B n     -> do (hn,tn) <- n
+                      return $ Left (bindBInternal (rerunB h t) f, hn, minTime t tn)
+
 
 
 bindB :: Behavior a -> (a -> Behavior b) -> Behavior b
 bindB (Const x) f = f x
-bindB (B m)     f = B $
-     do (h,t) <- m
-        case f h of
-          Const x -> return (x, (`bindB` f) <$> t)
-          B n     -> do (hn,tn) <- n
-                        tn <- runE tn
-                        return $ case (t,tn) of
-                          (_, Occ _)  -> error "switch already occured!"
-                          (Occ _ , _) -> error "switch already occured!"
-                          (Never , e) -> (hn, e)
-                          (e, Never ) -> (hn, (`bindB` f) <$> t)
-                          (e, E tm) -> (hn, switchEM tm (runE ((`bindB` f) <$> e)) )
+bindB (B m)     f = memoBInt $ bindBInternal m f
 
+whenJustInternal :: M (Maybe a, Event (Behavior (Maybe a))) -> Behavior (Event a) -> BInternal (Event a)
+whenJustInternal m outerSelf = BInternal $ 
+    do (h, t) <- m
+       case t of
+        Never -> return $ Right $ pure $ case h of
+                            Just x -> pure x
+                            Nothing -> never
+        Occ _ -> error "invariant broken"
+        _     -> 
+         case h of
+          Just x -> return $ Left (whenJustInternal (rerunB h t) outerSelf, return x, setE () t)
+          Nothing -> 
+           do  en <- planM (setE (runB outerSelf) t)
+               return $ Left (whenJustInternal (rerunB h t) outerSelf, en >>= fst, setE () t)
 
 
 whenJust' :: Behavior (Maybe a) -> Behavior (Event a)
 whenJust' (Const Nothing)  = pure never
 whenJust' (Const (Just x)) = pure (pure x)
-whenJust' (B m) = B $ 
-    do  (h, t) <- m
-        case h of
-         Just x -> return (return x, whenJust'  <$> t)
-         Nothing -> 
-          do  en <- planM (runB . whenJust'  <$> t)
-              return (en >>= fst, en >>= snd)
+whenJust' (B m) =  let x =  memoBInt $ whenJustInternal m x
+                   in x
+    
 
-
+{-
 whenJustSample' :: Behavior (Maybe (Behavior a)) -> Behavior (Event a)
 whenJustSample' (Const Nothing)  = pure never
 whenJustSample' (Const (Just x)) = B $ do v <- fst <$> runB x; return (pure v, never)
@@ -220,16 +308,16 @@ whenJustSample' (B bm) = B $
      case h of
       Just x -> do v <- fst <$> runB x; return (pure v, whenJustSample' <$> t)
       Nothing -> do en <- planM (runB . whenJustSample' <$> t)
-                    return (en >>= fst, en >>= snd)
-
+                    return (en >>= fst, never)
+-}
 instance Monad Behavior where
   return x = B $ return (x, never)
-  m >>= f = memoB (m `bindB` f)
+  m >>= f = m `bindB` f
 
 instance MonadFix Behavior where
   mfix f = B $ mfix $ \(~(h,_)) ->
-       do  ~(h',t) <- runB (f h)
-           return (h, mfix f <$ t)
+       do  (h',t) <- runB (f h)
+           return (h', mfix f <$ t )
 
 -- | Introduce a change over time.
 --
@@ -239,9 +327,11 @@ instance MonadFix Behavior where
 --
 -- Gives a behavior that acts as @b@ initially, and switches to the behavior inside @e@ as soon as @e@ occurs.
 --  
-switch :: Behavior a -> Event (Behavior a) -> Behavior a
-switch b e = memoB (switch' b e)
-
+switch ::  Behavior a -> Event (Behavior a) -> Behavior a
+switch b Never = b
+switch _ (Occ b) = b
+switch (Const x) (E em) = memoBInt (stepInternal x em)
+switch (B bm) (E em) = memoBInt (switchInternal bm em)
 -- | Observe a change over time.
 -- 
 -- The behavior @whenJust b@ gives at any point in time the event that 
@@ -262,9 +352,9 @@ switch b e = memoB (switch' b e)
 -- If @b@ never again is positive then the result is 'never'.
 
 whenJust :: Behavior (Maybe a) -> Behavior (Event a)
-whenJust b = memoB (whenJust' b)
+whenJust b = (whenJust' b)
 
-
+{-
 -- | A more optimized version of:
 -- 
 -- > whenJustSample b = do x <- whenJust b 
@@ -272,7 +362,7 @@ whenJust b = memoB (whenJust' b)
 
 whenJustSample :: Behavior (Maybe (Behavior a)) -> Behavior (Event a)
 whenJustSample b = memoB (whenJustSample' b)
-
+-}
 
 -- | Not typically needed, used for event streams.
 --  
@@ -283,9 +373,8 @@ whenJustSample b = memoB (whenJustSample' b)
 -- If the implementation samples such an event and it turns out the event does actually occur at the time
 -- the behavior is sampled, an error is thrown.
 futuristic :: Behavior (Event a) -> Behavior (Event a)
-futuristic b =  B $ do e <- makeLazy (joinEm <$> runB b) 
-                       return (fst <$> e, snd <$> e)
-  where joinEm (e,es) = (,) <$> e <*> es
+futuristic b =  B $ do e <- makeLazy $  fst <$>  runB b
+                       return (e,futuristic b <$ e) 
 
 unrunB :: (a,Event (Behavior a)) -> Behavior a 
 unrunB (h, Never) = Const h
@@ -293,7 +382,7 @@ unrunB (h,t) = B $
   runE t >>= \x -> case x of
         Occ b -> runB b
         t' -> return (h,t')
-
+{-
 memoBIO :: Behavior a -> IO (Behavior a)
 memoBIO einit = 
   do r <- newIORef einit 
@@ -310,7 +399,7 @@ memoB :: Behavior a -> Behavior a
 --memoB b = b
 memoB b@(Const _) = b
 memoB b = unsafePerformIO $ memoBIO b
-
+-}
 -- Section 6.7
 
 
@@ -335,8 +424,7 @@ type M = ReaderT Env IO
 --    do x <- sample b; m ; y <- sample b; return (x,y) 
 -- == do x <- sample b; m ; return (x,x) 
 -- @
-newtype Now a = Now { getNow :: M a } deriving (Functor,Applicative,Monad, MonadFix)
-
+newtype Now a = Now { getNow :: M a } deriving (Functor,Applicative,Monad, MonadFix, MonadIO)
 
 -- | Sample the present value of a behavior
 sampleNow :: Behavior a -> Now a
@@ -424,7 +512,7 @@ data Lazy = forall a. Lazy (M (Event a)) (IORef (Event a))
 makeLazy :: M (Event a) -> M (Event a)
 makeLazy m =  ReaderT $ \env ->
        do n <- curRound (clock env)   
-          r <- newIORef undefined
+          r <- newIORef (error "should not have read lazy yet")
           modifyIORef (laziesRef env) (Lazy m r :)
           return (readLazyState n r)
 
@@ -448,7 +536,12 @@ planM e = plan makeWeakIORef e
 -- When given a event carrying a now computation, execute that now computation as soon as the event occurs.
 -- If the event has already occured when 'planNow' is called, then the 'Now' computation will be executed immediatly.
 planNow :: Event (Now a) -> Now (Event a)
-planNow e = Now $ plan makeStrongRef (getNow  <$> e)
+planNow e = Now $ 
+  do e' <- runE e
+     case e' of
+      Occ x -> pure <$> getNow x
+      Never -> return Never
+      _     -> plan makeStrongRef (getNow  <$> e)
 
 plan :: (forall v. IORef v -> IO (Ref (IORef v))) -> Event (M a) -> M (Event a)
 plan makeRef e = 
@@ -478,7 +571,7 @@ initNow schedule (Now m) =
         let env = Env pr lr c
         let it = runReaderT (iteration e) env
         e <- runReaderT m env
-        schedule (runReaderT (iterationMeat e) env)
+        runReaderT (iterationMeat e) env
         return ()
 
 iteration :: Event a -> M (Maybe a)
@@ -507,7 +600,8 @@ tryPlans = ReaderT $ tryEm where
        writeIORef (plansRef env) []
        runReaderT (mapM_ tryPlan (reverse pl)) env
   tryPlan (SomePlan pr) = 
-   do  ps <-  liftIO (deRef pr) 
+   do  -- liftIO (traceIO "plan!")
+       ps <-  liftIO (deRef pr) 
        case ps of
         Just p -> do  eres <- runE (planToEv p)
                       case eres of
@@ -530,6 +624,12 @@ runLazies = ReaderT $ runEm where
                             Occ _ -> error "Forced lazy was not lazy!"
                             e'    -> liftIO $ writeIORef r e'
 
+-- | When using the FRP system in master mode, with 'runNowMaster', this exception is thrown if 
+-- the FRP system is not doing anything anymore, waiting for 'never'.
+
+data FRPWaitsForNeverException = FRPWaitsForNeverException deriving (Show, Typeable)
+
+instance Exception FRPWaitsForNeverException
 
 -- | Run the FRP system in master mode.
 --
@@ -544,7 +644,9 @@ runNowMaster m =
       initNow enqueue m
       loop chan where
   loop chan = 
-      do m <- readChan chan
+      do m <-   catch (readChan chan)
+                  (\e -> do let err = (e :: BlockedIndefinitelyOnMVar)
+                            throw FRPWaitsForNeverException)
          mr <- m
          case mr of
            Just x  -> return x
@@ -565,3 +667,4 @@ instance Functor Event where
 instance Applicative Event where
   pure = return
   (<*>) = ap
+

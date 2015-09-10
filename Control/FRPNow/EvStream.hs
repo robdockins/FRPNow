@@ -1,3 +1,6 @@
+{-# LANGUAGE ScopedTypeVariables,TypeOperators,MultiParamTypeClasses, FunctionalDependencies, FlexibleInstances #-}
+
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Control.FRPNow.EvStream
@@ -16,8 +19,11 @@ module Control.FRPNow.EvStream(
    -- * Construction
    emptyEs, 
    merge,
+collapseSimul,
+dropEv,
    toChanges,
    edges,
+joinEs,
    -- * Folds and scans
   scanlEv,
   foldrEv,
@@ -29,7 +35,7 @@ module Control.FRPNow.EvStream(
   -- * Filter and scan
   catMaybesEs,filterEs,filterMapEs,filterMapEsB, filterB, during, beforeEs,
   -- * Combine behavior and eventstream
-  (<@@>) , snapshots,
+  (<@@>) , snapshots, delay,
   -- * IO interface
   callbackStream,callStream, callIOStream,
   -- * Debug 
@@ -89,6 +95,10 @@ merge l r = loop where
   nxt (LeftEarlier   l) = l
   nxt (RightEarlier  r) = r
 
+-- | Collapses each set of simultaneous events into a single event carrying the list of occurrences.
+collapseSimul :: EvStream a -> EvStream [a]
+collapseSimul (S s) = S $ ((\x -> [x]) <$>) <$> s
+
 -- | Obtain the next element of the event stream. The obtained event is guaranteed to lie in the future.
 next :: EvStream a -> Behavior (Event a)
 next s = (head <$>) <$> (nextAll s)
@@ -139,10 +149,18 @@ fromChanges i s = loop i where
 
 
 
+dropEv :: Int -> EvStream a -> EvStream a
+dropEv i (S s) = S $ loop i where
+  loop 0 = s
+  loop i = do e <- s
+              join <$> plan (loop (i-1) <$ e)
+
+
 -- | Filter the 'Just' values from an event stream.
 --
 catMaybesEs :: EvStream (Maybe a) -> EvStream a
 catMaybesEs s = S $ loop where
+--  loop :: Behavior (Event [a])
   loop = do  e <- getEs s
              join <$> plan (nxt <$> e)
   nxt l = case  catMaybes l of
@@ -193,9 +211,12 @@ scanlEv f i es = S <$> loop i where
      ev <- plan (loop . last <$> e')
      return (pure e' `switch` ev)
 
-
-
-
+-- | Turns an event of an event stream into an event stream.
+joinEs :: Event (EvStream b) -> EvStream b
+joinEs e = S $ before `switch` after where
+  before = join <$> plan (getEs <$> e)
+  after = getEs <$> e
+              
 
 
 -- | Left fold over an eventstream to create a behavior (behavior depends on when
@@ -261,13 +282,32 @@ beforeEs s e = S $ beforeEv `switch` en
         choose (Right x) = return x
             
 
+-- | Delay a behavior by one tick of the ``clock''.
+--
+-- The event stream functions as the ``clock'': the input behavior is sampled on each 
+-- event, and the current value of the output behavior is always the previously sample. 
+--
+--  Occasionally useful to prevent immediate feedback loops.
+delay ::  EvStream x -- ^ The event stream that functions as the ``clock''
+          -> a -- ^ The inital value of the output behavior
+          -> Behavior a  -- ^ The input behavior
+          -> Behavior (Behavior a)
+delay s i b = loop i where
+  loop i =
+           do e <- futuristic $ 
+                        do cur <- b
+                           e <- getEs s
+                           return (cur <$ e)
+              e' <- plan ( loop <$> e)
+              return (i `step` e')
 
 -- | Create an event stream that has an event each time the
 -- returned function is called. The function can be called from any thread.
-callbackStream :: Now (EvStream a, a -> IO ())
+callbackStream :: forall a. Now (EvStream a, a -> IO ())
 callbackStream = do mv <- sync $ newIORef ([], Nothing)
                     (_,s) <- loop mv
                     return (S s, func mv) where
+  loop :: IORef ( [a], Maybe (() -> IO ()) ) -> Now ([a], Behavior (Event [a]))
   loop mv =
          do (l, Nothing) <- sync $ readIORef mv
             (e,cb) <- callback
