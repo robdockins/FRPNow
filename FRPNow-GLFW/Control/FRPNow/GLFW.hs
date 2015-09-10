@@ -40,6 +40,12 @@ mouseButtonEvents win = do
                   mbcb (mb,btnst,mod,x,y)))
     return mbstr
 
+resizeEvents :: GLFW.Window -> Now (EvStream (Int,Int))
+resizeEvents win = do
+    (resizeStream, resizeCB) <- callbackStream
+    sync $ GLFW.setWindowSizeCallback win (Just (\_ x y -> resizeCB (x,y)))
+    return resizeStream
+
 mousePos :: GLFW.Window -> Now (Behavior (Double,Double))
 mousePos win = do
     curpos <- sync $ GLFW.getCursorPos win
