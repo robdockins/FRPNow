@@ -55,17 +55,22 @@ mousePos win = do
 
 
 runGLFW :: IO (Maybe (GLFW.Window))
-        -> (GLFW.Window -> EvStream (Double,Double) -> Now (EvStream (IO ())))
+        -> (GLFW.Window -> Behavior Double
+                        -> EvStream (Double, Double)
+                        -> Now (Behavior (IO ())))
         -> IO ()
-runGLFW mkWin doRender = do
-  GLFW.init
-  bracket mkWin
-     (maybe (return ()) GLFW.destroyWindow)
-     (maybe (return ()) startup)
-  GLFW.terminate
+runGLFW mkWin doRender =
+  GLFW.init >> bracket mkWin cleanup startup
 
  where
-  startup win = do
+  cleanup Nothing = do
+      GLFW.terminate
+  cleanup (Just win) = do
+      GLFW.destroyWindow win
+      GLFW.terminate
+
+  startup Nothing = fail "Failed to open main window"
+  startup (Just win) = do
     GLFW.makeContextCurrent (Just win)
     scheduleRef <- newIORef Seq.empty
     timecbRef  <- newIORef (\_ -> return ())
@@ -77,8 +82,10 @@ runGLFW mkWin doRender = do
   go win timecbRef renderVar = do
     (tstr, tcb)   <- callbackStream
     sync $ writeIORef timecbRef tcb
-    evs <- doRender win tstr
-    callIOStream (pushRender renderVar) evs
+    clock <- sampleNow $ fromChanges 0 $ fmap fst tstr
+    evs <- doRender win clock tstr
+    let evs' = snapshots evs (fmap (const ()) tstr)
+    callIOStream (pushRender renderVar) evs'
     return never
 
   pushRender v x = do
@@ -91,7 +98,7 @@ runGLFW mkWin doRender = do
   loop win renderVar scheduleRef timecb t = do
     Just t' <- GLFW.getTime
     let dt = t' - t
-    timecb (t',dt)
+    timecb (t', dt)
     rounds <- atomicModifyIORef scheduleRef (\s -> (Seq.empty, s))
     sequence_ (Fold.toList rounds)
     render <- swapMVar renderVar Nothing
